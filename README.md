@@ -18,3 +18,6 @@ This is a program for quickly downloading video and audio from YouTube, written 
 ## Usage
 
 Via CLI interface
+```bash
+python VideoDownloader.py
+```
