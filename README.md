@@ -1,3 +1,5 @@
+> This project is no longer maintained. The repository is archived.
+
 # YouTube Video and Audio Downloader
 
 This is a program for quickly downloading video and audio from YouTube, written in Python. 
