@@ -11,6 +11,7 @@ from yt_dlp.utils import DownloadError
 CONFIG_PATH = Path(__file__).resolve().parent / "config.env"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DOWNLOADS = str(SCRIPT_DIR)
+OUTTMPL = "%(title)s.%(ext)s"
 STANDARD_RESOLUTIONS = [4320, 2160, 1440, 1080, 720, 480, 360, 240, 144]
 
 YOUTUBE_OPTS = {
@@ -50,9 +51,9 @@ def ensure_config():
 
 
 def get_proxy_url(cfg):
-    if cfg.get("PROXY_ENABLED") != "1" or not cfg.get("PROXY_URL"):
+    if cfg.get("PROXY_ENABLED") != "1":
         return None
-    raw = cfg["PROXY_URL"].strip()
+    raw = (cfg.get("PROXY_URL") or "").strip()
     if not raw:
         return None
     if "://" not in raw:
@@ -60,17 +61,28 @@ def get_proxy_url(cfg):
     return raw
 
 
+def get_download_dir(cfg):
+    path = (cfg.get("DOWNLOAD_PATH") or "").strip() or DEFAULT_DOWNLOADS
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _ydl_opts(proxy_url, **kwargs):
+    if proxy_url:
+        kwargs["proxy"] = proxy_url
+    return kwargs
+
+
 def download_audio(url, out_dir, proxy_url):
-    opts = {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(out_dir, "%(title)s.%(ext)s"),
-        "postprocessors": [
+    opts = _ydl_opts(
+        proxy_url,
+        format="bestaudio/best",
+        outtmpl=os.path.join(out_dir, OUTTMPL),
+        postprocessors=[
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
-        "quiet": False,
-    }
-    if proxy_url:
-        opts["proxy"] = proxy_url
+        quiet=False,
+    )
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
@@ -93,35 +105,65 @@ def _parse_height(f):
     return None
 
 
+def _format_height(f):
+    return _parse_height(f) or 0
+
+
+def _collect_heights(info):
+    out = set()
+    for f in info.get("formats") or []:
+        if f.get("vcodec") in (None, "none"):
+            continue
+        h = _parse_height(f)
+        if h and 72 <= h <= 4320:
+            out.add(h)
+    return out
+
+
 def get_available_heights(url, proxy_url):
-    def _extract(opts_extra):
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            **opts_extra,
-        }
-        if proxy_url:
-            opts["proxy"] = proxy_url
-        out = set()
+    for opts_extra in (YOUTUBE_OPTS, {}):
+        opts = _ydl_opts(proxy_url, quiet=True, no_warnings=True, **opts_extra)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                if not info:
-                    return out
-                for f in info.get("formats") or []:
-                    if f.get("vcodec") in (None, "none"):
-                        continue
-                    h = _parse_height(f)
-                    if h and 72 <= h <= 4320:
-                        out.add(int(h))
+                if info:
+                    heights = _collect_heights(info)
+                    if heights:
+                        return heights
         except Exception:
             pass
-        return out
+    return set()
 
-    heights = _extract(YOUTUBE_OPTS)
-    if not heights:
-        heights = _extract({})
-    return heights
+
+def _pick_best_stream(streams, max_height):
+    eligible = [f for f in streams if _format_height(f) <= max_height]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda f: (_format_height(f), (f.get("vcodec") or "").startswith("avc")),
+    )
+
+
+def _pick_best_audio(audio_only):
+    preferred = next(
+        (
+            f
+            for f in audio_only
+            if f.get("ext") in ("m4a", "mp4") or (f.get("acodec") or "").startswith("mp4a")
+        ),
+        None,
+    )
+    return preferred or next(iter(audio_only), None)
+
+
+def _merge_streams(video, audio):
+    return {
+        "format_id": f"{video['format_id']}+{audio['format_id']}",
+        "ext": video.get("ext") or "mp4",
+        "requested_formats": [video, audio],
+        "protocol": f"{video.get('protocol', 'unknown')}+{audio.get('protocol', 'unknown')}",
+    }
 
 
 def _make_format_selector(max_height):
@@ -131,65 +173,46 @@ def _make_format_selector(max_height):
         audio_only = [f for f in formats if f.get("acodec") != "none" and f.get("vcodec") == "none"]
         combined = [f for f in formats if f.get("vcodec") != "none" and f.get("acodec") != "none"]
 
-        def vid_height(f):
-            return _parse_height(f) or 0
-
-        best_video = None
-        for f in sorted(video_only, key=vid_height, reverse=True):
-            if vid_height(f) <= max_height and (f.get("vcodec") or "").startswith("avc"):
-                best_video = f
-                break
-        if not best_video:
-            for f in sorted(video_only, key=vid_height, reverse=True):
-                if vid_height(f) <= max_height:
-                    best_video = f
-                    break
-        best_audio = next((f for f in audio_only if f.get("ext") in ("m4a", "mp4") or (f.get("acodec") or "").startswith("mp4a")), None)
-        if not best_audio:
-            best_audio = next(iter(audio_only), None)
+        best_video = _pick_best_stream(video_only, max_height)
+        best_audio = _pick_best_audio(audio_only)
         if best_video and best_audio:
-            yield {
-                "format_id": f"{best_video['format_id']}+{best_audio['format_id']}",
-                "ext": best_video.get("ext") or "mp4",
-                "requested_formats": [best_video, best_audio],
-                "protocol": f"{best_video.get('protocol', 'unknown')}+{best_audio.get('protocol', 'unknown')}",
-            }
+            yield _merge_streams(best_video, best_audio)
             return
-        for f in sorted(combined, key=vid_height, reverse=True):
-            if vid_height(f) <= max_height and f.get("vcodec") and f["vcodec"].startswith("avc"):
-                yield f
-                return
-        for f in sorted(combined, key=vid_height, reverse=True):
-            if vid_height(f) <= max_height:
-                yield f
-                return
-        if best_video and best_audio:
-            yield {
-                "format_id": f"{best_video['format_id']}+{best_audio['format_id']}",
-                "ext": best_video.get("ext") or "mp4",
-                "requested_formats": [best_video, best_audio],
-                "protocol": f"{best_video.get('protocol', 'unknown')}+{best_audio.get('protocol', 'unknown')}",
-            }
-        else:
-            fallback = next((f for f in combined if vid_height(f) <= max_height), None) or next((f for f in formats if f.get("vcodec") != "none"), None)
-            if fallback:
-                yield fallback
+
+        combined_pick = _pick_best_stream(combined, max_height)
+        if combined_pick:
+            yield combined_pick
+            return
+
+        fallback = next((f for f in combined if _format_height(f) <= max_height), None)
+        if not fallback:
+            fallback = next((f for f in formats if f.get("vcodec") != "none"), None)
+        if fallback:
+            yield fallback
 
     return format_selector
 
 
 def download_video(url, out_dir, height, proxy_url):
-    opts = {
-        "format": _make_format_selector(height),
-        "merge_output_format": "mp4",
-        "outtmpl": os.path.join(out_dir, "%(title)s.%(ext)s"),
-        "quiet": False,
+    opts = _ydl_opts(
+        proxy_url,
+        format=_make_format_selector(height),
+        merge_output_format="mp4",
+        outtmpl=os.path.join(out_dir, OUTTMPL),
+        quiet=False,
         **YOUTUBE_OPTS,
-    }
-    if proxy_url:
-        opts["proxy"] = proxy_url
+    )
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
+
+
+def _download_with_feedback(download_fn, url, out_dir, proxy_url):
+    try:
+        download_fn(url, out_dir, proxy_url)
+        print("Download completed successfully.")
+    except DownloadError as e:
+        print(f"Download failed: {e}")
+    time.sleep(3)
 
 
 def run_start(cfg):
@@ -204,25 +227,20 @@ def run_start(cfg):
     ).ask()
     if choice is None:
         return
+    out_dir = get_download_dir(cfg)
     if choice == "Download audio only":
-        out_dir = (cfg.get("DOWNLOAD_PATH") or "").strip() or DEFAULT_DOWNLOADS
-        os.makedirs(out_dir, exist_ok=True)
-        try:
-            download_audio(url, out_dir, proxy_url)
-            print("Download completed successfully.")
-        except DownloadError as e:
-            print(f"Download failed: {e}")
-        time.sleep(3)
+        _download_with_feedback(download_audio, url, out_dir, proxy_url)
         return
-    out_dir = (cfg.get("DOWNLOAD_PATH") or "").strip() or DEFAULT_DOWNLOADS
-    os.makedirs(out_dir, exist_ok=True)
     available = get_available_heights(url, proxy_url)
     if available:
         res_choices = [f"{r}p" for r in STANDARD_RESOLUTIONS if any(h >= r for h in available)]
         res_prompt = "Select resolution (Ctrl+C to return to menu)"
     else:
         res_choices = [f"{r}p" for r in STANDARD_RESOLUTIONS]
-        res_prompt = "Select resolution (Ctrl+C to return to menu)\n\nNote: actual resolutions could not be retrieved; this may cause an error."
+        res_prompt = (
+            "Select resolution (Ctrl+C to return to menu)\n\n"
+            "Note: actual resolutions could not be retrieved; this may cause an error."
+        )
     if not res_choices:
         print("Could not get available resolutions for this video.")
         time.sleep(3)
@@ -265,8 +283,7 @@ def run_settings(cfg):
         elif choice == "Change download folder":
             path = questionary.text("Download folder path (Ctrl+C to return to menu):").ask()
             if path and path.strip():
-                path = os.path.expanduser(path.strip())
-                cfg["DOWNLOAD_PATH"] = path
+                cfg["DOWNLOAD_PATH"] = os.path.expanduser(path.strip())
                 save_config(cfg)
         elif choice == "Reset download folder to default":
             cfg["DOWNLOAD_PATH"] = ""
